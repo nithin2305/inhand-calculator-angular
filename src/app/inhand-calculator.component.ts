@@ -1,4 +1,4 @@
-import { Component, OnInit, computed, signal } from '@angular/core';
+import { Component, OnInit, computed, effect, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 
@@ -20,6 +20,8 @@ interface Slab {
 
 interface CalcResult {
   annualGross: number;
+  grossTax: number;
+  rebate: number;
   annualTax: number;
   annualSuper: number;
   annualNet: number;
@@ -60,9 +62,18 @@ const FX_API = 'https://open.er-api.com/v6/latest/AUD';
 const FALLBACK_AUD_PGK = 3.03;
 // Fallback PGK → INR rate (10 Jul 2026), used if the API is unreachable
 const FALLBACK_PGK_INR = 21.0;
+// Fallback PGK → USD rate (10 Jul 2026), used if the API is unreachable
+const FALLBACK_PGK_USD = 0.24;
+
+// PNG dependant rebate (PwC WWTS, Mar 2026): 1st dependant 15% of gross tax
+// (min K45, max K450); 2nd & 3rd 10% each (min K30, max K300); max 3 dependants.
+const REBATE_1 = { pct: 0.15, min: 45, max: 450 };
+const REBATE_23 = { pct: 0.1, min: 30, max: 300 };
 
 type FxStatus = 'loading' | 'live' | 'fallback' | 'edited';
-type ResultCurrency = 'PGK' | 'AUD' | 'INR';
+type ResultCurrency = 'PGK' | 'AUD' | 'INR' | 'USD';
+type Period = 'annual' | 'monthly' | 'fortnightly';
+type Dependants = 0 | 1 | 2 | 3;
 
 @Component({
   selector: 'app-inhand-calculator',
@@ -217,6 +228,21 @@ type ResultCurrency = 'PGK' | 'AUD' | 'INR';
           </div>
         </div>
 
+        <!-- Dependants -->
+        <div class="field" *ngIf="residency() === 'resident'">
+          <span class="label">Dependants (tax rebate)</span>
+          <div class="segment self-start" role="group" aria-label="Dependants">
+            <button
+              *ngFor="let o of dependantOpts"
+              class="seg-btn"
+              [class.active]="dependants() === o.key"
+              (click)="dependants.set(o.key)"
+            >
+              {{ o.label }}
+            </button>
+          </div>
+        </div>
+
         <!-- Split bar -->
         <div class="bar-section">
           <div class="bar-track" aria-hidden="true">
@@ -287,6 +313,14 @@ type ResultCurrency = 'PGK' | 'AUD' | 'INR';
             <span class="row-label">Annual tax</span>
             <span class="row-value tax">− {{ sym() }} {{ d(c.annualTax) | number : '1.2-2' }}</span>
           </div>
+          <div class="row" *ngIf="c.rebate > 0">
+            <span class="row-label">
+              Dependant rebate included ({{ dependants() }}{{ dependants() === 3 ? '+' : '' }})
+            </span>
+            <span class="row-value super">
+              saves {{ sym() }} {{ d(c.rebate) | number : '1.2-2' }}
+            </span>
+          </div>
           <div class="row">
             <span class="row-label">
               Annual super ({{ superPctNum() }}%){{ !c.deducted ? ' · on top' : '' }}
@@ -352,19 +386,23 @@ type ResultCurrency = 'PGK' | 'AUD' | 'INR';
             <span class="right" [class.amber]="sl.tax > 0">{{ sl.tax | number : '1.2-2' }}</span>
           </div>
           <div class="slab-row slab-total">
-            <span>Total</span>
+            <span>Total (before rebate)</span>
             <span class="right">{{ c.effectiveRate | number : '1.1-1' }}%</span>
             <span class="right">{{ c.annualGross | number : '1.2-2' }}</span>
-            <span class="right amber">{{ c.annualTax | number : '1.2-2' }}</span>
+            <span class="right amber">{{ c.grossTax | number : '1.2-2' }}</span>
           </div>
         </div>
 
+        <button class="slab-toggle" (click)="copyLink()">{{ copyLabel() }}</button>
+
         <p class="footnote">
-          Rates are fetched live from open.er-api.com/v6/latest/AUD (PGK and INR) and displayed
+          Rates are fetched live from open.er-api.com/v6/latest/AUD (PGK, INR, USD) and displayed
           exactly as the API returns them. AUD packages are converted to kina before tax — PNG
           salary &amp; wages tax is assessed on the PGK value, and employee super contributions
-          are deducted after tax. AUD/INR result views are indicative conversions of the PGK
-          amounts. Excludes dependant rebates.
+          are deducted after tax. AUD/INR/USD result views are indicative conversions of the PGK
+          amounts. Dependant rebate: 15% of gross tax (K45–K450) for the first dependant, 10%
+          (K30–K300) each for the second and third; residents only. Your inputs are saved in this
+          browser and encoded in the URL for sharing.
         </p>
       </div>
     </div>
@@ -651,17 +689,32 @@ export class InhandCalculatorComponent implements OnInit {
   liveRate = signal<number | null>(null);
   superPct = signal<number | null>(6);
   superMode = signal<'included' | 'excluded'>('included');
-  period = signal<'annual' | 'monthly'>('annual');
+  period = signal<Period>('annual');
   residency = signal<'resident' | 'nonResident'>('resident');
   showSlabs = signal(false);
   resultCurrency = signal<ResultCurrency>('PGK');
   pgkInrRate = signal<number>(FALLBACK_PGK_INR); // PGK → INR
+  pgkUsdRate = signal<number>(FALLBACK_PGK_USD); // PGK → USD
+  dependants = signal<Dependants>(0);
+  copyLabel = signal('Copy share link');
 
-  readonly resultCurrencies: ResultCurrency[] = ['PGK', 'AUD', 'INR'];
+  readonly resultCurrencies: ResultCurrency[] = ['PGK', 'AUD', 'INR', 'USD'];
+  readonly dependantOpts = [
+    { key: 0 as Dependants, label: '0' },
+    { key: 1 as Dependants, label: '1' },
+    { key: 2 as Dependants, label: '2' },
+    { key: 3 as Dependants, label: '3+' },
+  ];
   readonly periods = [
     { key: 'annual' as const, label: 'Annual' },
     { key: 'monthly' as const, label: 'Monthly' },
+    { key: 'fortnightly' as const, label: 'Fortnightly' },
   ];
+
+  constructor() {
+    this.restoreState();
+    effect(() => this.persistState());
+  }
   readonly residencies = [
     { key: 'resident' as const, label: 'Resident' },
     { key: 'nonResident' as const, label: 'Non-resident' },
@@ -673,7 +726,11 @@ export class InhandCalculatorComponent implements OnInit {
   superPctNum = computed(() => Number(this.superPct()) || 0);
   enteredAnnual = computed(() => {
     const g = Number(this.gross()) || 0;
-    return this.period() === 'annual' ? g : g * 12;
+    switch (this.period()) {
+      case 'annual': return g;
+      case 'monthly': return g * 12;
+      case 'fortnightly': return g * 26;
+    }
   });
 
   /** Multiplier that converts a PGK amount into the selected result currency. */
@@ -685,10 +742,14 @@ export class InhandCalculatorComponent implements OnInit {
         return this.rateNum() > 0 ? 1 / this.rateNum() : 0;
       case 'INR':
         return this.pgkInrRate();
+      case 'USD':
+        return this.pgkUsdRate();
     }
   });
 
-  sym = computed(() => ({ PGK: 'K', AUD: 'A$', INR: '₹' }[this.resultCurrency()]));
+  sym = computed(
+    () => ({ PGK: 'K', AUD: 'A$', INR: '₹', USD: '$' }[this.resultCurrency()])
+  );
 
   /** Convert a PGK amount to the selected result currency. */
   d(pgk: number): number {
@@ -704,13 +765,25 @@ export class InhandCalculatorComponent implements OnInit {
     const rateValid = !isAud || rate > 0;
     if (!(g > 0) || s < 0 || s >= 100 || !rateValid) return null;
 
-    const enteredAnnual = this.period() === 'annual' ? g : g * 12;
+    const enteredAnnual = this.enteredAnnual();
     const annualGross = isAud ? enteredAnnual * rate : enteredAnnual; // PGK
 
     const annualSuper = annualGross * (s / 100);
 
     // PNG SWT is levied on gross salary; employee super contributions are post-tax
-    const { tax, slabs } = this.computeTax(annualGross, BRACKETS[this.residency()]);
+    const residency = this.residency();
+    const { tax: grossTax, slabs } = this.computeTax(annualGross, BRACKETS[residency]);
+
+    // Dependant rebate — residents only, capped at gross tax
+    let rebate = 0;
+    const dep = this.dependants();
+    if (residency === 'resident' && dep > 0 && grossTax > 0) {
+      rebate += Math.min(Math.max(grossTax * REBATE_1.pct, REBATE_1.min), REBATE_1.max);
+      if (dep >= 2) rebate += Math.min(Math.max(grossTax * REBATE_23.pct, REBATE_23.min), REBATE_23.max);
+      if (dep >= 3) rebate += Math.min(Math.max(grossTax * REBATE_23.pct, REBATE_23.min), REBATE_23.max);
+      rebate = Math.min(rebate, grossTax);
+    }
+    const tax = grossTax - rebate;
 
     const deducted = this.superMode() === 'included';
     const annualNet = annualGross - tax - (deducted ? annualSuper : 0);
@@ -718,6 +791,8 @@ export class InhandCalculatorComponent implements OnInit {
 
     return {
       annualGross,
+      grossTax,
+      rebate,
       annualTax: tax,
       annualSuper,
       annualNet,
@@ -728,7 +803,7 @@ export class InhandCalculatorComponent implements OnInit {
       fortnightlyNet: annualNet / 26,
       monthlyNetAud: toAud(annualNet / 12),
       annualNetAud: toAud(annualNet),
-      effectiveRate: (tax / annualGross) * 100,
+      effectiveRate: (grossTax / annualGross) * 100,
       netShare: (annualNet / annualGross) * 100,
       taxShare: (tax / annualGross) * 100,
       superShare: deducted ? (annualSuper / annualGross) * 100 : 0,
@@ -770,10 +845,12 @@ export class InhandCalculatorComponent implements OnInit {
       const data = await res.json();
       const audPgk: number | undefined = data?.rates?.PGK; // AUD base → PGK, direct
       const audInr: number | undefined = data?.rates?.INR; // AUD base → INR, direct
+      const audUsd: number | undefined = data?.rates?.USD; // AUD base → USD, direct
       if (data?.result === 'success' && data?.base_code === 'AUD' && audPgk && audPgk > 0) {
         this.fxRate.set(audPgk); // display exactly as returned
         this.liveRate.set(audPgk);
         if (audInr && audInr > 0) this.pgkInrRate.set(audInr / audPgk); // cross rate via AUD
+        if (audUsd && audUsd > 0) this.pgkUsdRate.set(audUsd / audPgk); // cross rate via AUD
         this.fxUpdated.set(data.time_last_update_utc ?? null);
         this.fxStatus.set('live');
       } else {
@@ -782,6 +859,7 @@ export class InhandCalculatorComponent implements OnInit {
     } catch {
       this.fxRate.set(FALLBACK_AUD_PGK);
       this.pgkInrRate.set(FALLBACK_PGK_INR);
+      this.pgkUsdRate.set(FALLBACK_PGK_USD);
       this.liveRate.set(null);
       this.fxUpdated.set(null);
       this.fxStatus.set('fallback');
@@ -791,6 +869,76 @@ export class InhandCalculatorComponent implements OnInit {
   onFxEdited(value: number | null): void {
     this.fxRate.set(value);
     this.fxStatus.set('edited');
+  }
+
+  async copyLink(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(location.href);
+      this.copyLabel.set('Link copied ✓');
+    } catch {
+      this.copyLabel.set(location.href); // clipboard blocked — show the URL itself
+    }
+    setTimeout(() => this.copyLabel.set('Copy share link'), 2500);
+  }
+
+  /** Restore inputs from the URL (share links win) or localStorage. */
+  private restoreState(): void {
+    const q = new URLSearchParams(location.search);
+    let s: Record<string, unknown> | null = null;
+    if (location.search.length > 1) {
+      s = {
+        g: q.get('g'), c: q.get('cur'), s: q.get('sup'), m: q.get('sm'),
+        p: q.get('per'), r: q.get('res'), v: q.get('view'), d: q.get('dep'),
+      };
+    } else {
+      try {
+        s = JSON.parse(localStorage.getItem('ihc-state') ?? 'null');
+      } catch {
+        s = null;
+      }
+    }
+    if (!s) return;
+    const num = (v: unknown) => (v == null || v === '' ? NaN : Number(v));
+    if (num(s['g']) > 0) this.gross.set(num(s['g']));
+    if (s['c'] === 'AUD' || s['c'] === 'PGK') this.inputCurrency.set(s['c']);
+    if (num(s['s']) >= 0 && num(s['s']) < 100) this.superPct.set(num(s['s']));
+    if (s['m'] === 'included' || s['m'] === 'excluded') this.superMode.set(s['m']);
+    if (s['p'] === 'annual' || s['p'] === 'monthly' || s['p'] === 'fortnightly') {
+      this.period.set(s['p']);
+    }
+    if (s['r'] === 'resident' || s['r'] === 'nonResident') this.residency.set(s['r']);
+    if ((this.resultCurrencies as string[]).includes(s['v'] as string)) {
+      this.resultCurrency.set(s['v'] as ResultCurrency);
+    }
+    if ([0, 1, 2, 3].includes(num(s['d']))) this.dependants.set(num(s['d']) as Dependants);
+  }
+
+  /** Persist inputs to localStorage and mirror non-default ones into the URL. */
+  private persistState(): void {
+    const g = this.gross();
+    const c = this.inputCurrency();
+    const s = this.superPct();
+    const m = this.superMode();
+    const p = this.period();
+    const r = this.residency();
+    const v = this.resultCurrency();
+    const dep = this.dependants();
+    try {
+      localStorage.setItem('ihc-state', JSON.stringify({ g, c, s, m, p, r, v, d: dep }));
+    } catch {
+      /* private mode — ignore */
+    }
+    const q = new URLSearchParams();
+    if (g) q.set('g', String(g));
+    if (c !== 'AUD') q.set('cur', c);
+    if (s !== null && s !== 6) q.set('sup', String(s));
+    if (m !== 'included') q.set('sm', m);
+    if (p !== 'annual') q.set('per', p);
+    if (r !== 'resident') q.set('res', r);
+    if (v !== 'PGK') q.set('view', v);
+    if (dep > 0) q.set('dep', String(dep));
+    const qs = q.toString();
+    history.replaceState(null, '', qs ? `${location.pathname}?${qs}` : location.pathname);
   }
 
   fmtLimit(n: number): string {
@@ -812,3 +960,4 @@ export class InhandCalculatorComponent implements OnInit {
     return { tax, slabs };
   }
 }
+// deployed via gh-pages
